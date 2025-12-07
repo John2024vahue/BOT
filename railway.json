@@ -1,11 +1,17 @@
 {
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "pip install -r requirements.txt"
+    "buildCommand": "pip install --upgrade pip && pip install -r requirements.txt",
+    "nixpacksConfig": {
+      "phases": {
+        "setup": {
+          "aptPkgs": ["gcc", "g++", "python3-dev", "build-essential", "libpq-dev"]
+        }
+      }
+    }
   },
   "deploy": {
     "startCommand": "python bot.py",
-    "healthcheckPath": "/",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
