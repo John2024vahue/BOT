@@ -15,9 +15,9 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.stem import SnowballStemmer
-from textblob import TextBlob
+from sklearn.metrics.pairwise import cosine_similarity
 from langdetect import detect
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 import sys
 import atexit
 
@@ -164,8 +164,6 @@ GROUP_IDS = {
 MAIN_MENU, ASK_TOPIC, CHOOSE_TOPIC, JOIN_CHAT, SUPPORT = range(5)
 
 # Глобальные переменные для кэширования
-topic_embeddings = {}
-topic_keywords = {}
 topic_vectors = None
 vectorizer = None
 
@@ -236,63 +234,43 @@ def init_database():
     logger.info("✅ База данных инициализирована")
 
 def preload_nlp_models():
-    """Предзагрузка NLP моделей для ускорения работы"""
-    global model, topic_embeddings, topic_keywords, topic_vectors, vectorizer
+    """Предзагрузка NLP моделей для ускорения работы (облегченная версия)"""
+    global topic_vectors, vectorizer
     
-    logger.info("🔄 Загрузка NLP моделей...")
+    logger.info("🔄 Загрузка NLP моделей (облегченная версия)...")
     
     try:
-        # Загружаем модель для работы с эмбеддингами
-        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        logger.info("✅ Модель SentenceTransformer загружена")
+        # Используем TF-IDF вместо тяжелых эмбеддингов
+        vectorizer = TfidfVectorizer(
+            stop_words=list(stop_words_ru) + list(stop_words_en),
+            max_features=1000,
+            ngram_range=(1, 2)
+        )
         
-        # Готовим данные для поиска
-        topic_keywords = {}
-        topic_descriptions = {}
+        # Подготавливаем тексты для обучения
+        topic_texts = []
+        topic_names = []
         
         for topic, data in DETAILED_TOPICS.items():
-            # Объединяем ключевые слова и описание
+            # Объединяем название, ключевые слова и описание
             keywords = " ".join(data['keywords'])
             description = data['description']
             full_text = f"{topic} {keywords} {description}"
             
-            topic_keywords[topic] = data['keywords']
-            topic_descriptions[topic] = full_text
+            topic_texts.append(full_text)
+            topic_names.append(topic)
         
-        # Создаем эмбеддинги для всех тем
-        logger.info("🔄 Генерация эмбеддингов тем...")
-        topic_names = list(topic_descriptions.keys())
-        topic_texts = list(topic_descriptions.values())
+        # Обучаем TF-IDF
+        logger.info("🔄 Обучение TF-IDF векторизатора...")
+        topic_vectors = vectorizer.fit_transform(topic_texts)
         
-        # Генерируем эмбеддинги пакетами для экономии памяти
-        embeddings = []
-        batch_size = 5  # Уменьшаем размер батча для Railway
-        
-        for i in range(0, len(topic_texts), batch_size):
-            batch = topic_texts[i:i+batch_size]
-            try:
-                batch_embeddings = model.encode(batch, convert_to_tensor=True, show_progress_bar=False)
-                embeddings.extend(batch_embeddings.cpu().numpy())
-                logger.info(f"✅ Обработано {min(i+batch_size, len(topic_texts))} из {len(topic_texts)} тем")
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка при обработке батча: {e}")
-                # Добавляем нулевые векторы в случае ошибки
-                for _ in range(len(batch)):
-                    embeddings.append(np.zeros(384))  # Размерность модели
-        
-        # Сохраняем эмбеддинги
-        for i, topic in enumerate(topic_names):
-            if i < len(embeddings):
-                topic_embeddings[topic] = embeddings[i]
-        
-        logger.info(f"✅ Эмбеддинги тем сгенерированы: {len(topic_embeddings)} тем")
-        
-        logger.info("✅ NLP модели успешно загружены")
+        logger.info(f"✅ TF-IDF модель обучена: {len(topic_names)} тем, {topic_vectors.shape[1]} признаков")
         
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки NLP моделей: {e}")
         logger.info("⚠️ Работа в режиме базового поиска")
-        model = None
+        vectorizer = None
+        topic_vectors = None
 
 def preprocess_text(text, language='ru'):
     """Предобработка текста для анализа"""
@@ -321,24 +299,6 @@ def preprocess_text(text, language='ru'):
         tokens = [stemmer_en.stem(token) for token in tokens if token not in stop_words_en and len(token) > 2]
     
     return " ".join(tokens), language
-
-def get_semantic_similarity(text1, text2):
-    """Вычисление семантического сходства между текстами"""
-    try:
-        if model is None:
-            return 0.0
-        
-        # Генерируем эмбеддинги
-        embeddings = model.encode([text1, text2], convert_to_tensor=True)
-        
-        # Вычисляем косинусное сходство
-        from sentence_transformers import util
-        cosine_scores = util.pytorch_cos_sim(embeddings[0], embeddings[1])
-        
-        return float(cosine_scores[0][0])
-    except Exception as e:
-        logger.error(f"❌ Ошибка вычисления семантического сходства: {e}")
-        return 0.0
 
 def find_best_matching_chat(user_query):
     """Интеллектуальный поиск наиболее подходящего чата"""
@@ -385,30 +345,23 @@ def find_best_matching_chat(user_query):
             logger.info(f"✅ Найдено совпадение по ключевым словам: {best_match} (score: {best_score:.2f})")
             return best_match, best_score, match_reason
         
-        # Шаг 3: Семантический поиск
-        logger.info("🧠 Семантический поиск...")
-        if model is not None:
-            best_semantic_match = None
-            best_semantic_score = 0.0
+                # Шаг 3: TF-IDF поиск (замена семантическому)
+        logger.info("🔤 TF-IDF поиск...")
+        if vectorizer is not None and topic_vectors is not None:
+            # Преобразуем запрос в TF-IDF вектор
+            query_vector = vectorizer.transform([processed_query])
             
-            for topic, embedding in topic_embeddings.items():
-                # Сравниваем с названием темы
-                topic_name_score = get_semantic_similarity(user_query, topic)
-                
-                # Сравниваем с описанием темы
-                topic_desc = DETAILED_TOPICS[topic]['description']
-                topic_desc_score = get_semantic_similarity(user_query, topic_desc)
-                
-                # Берем максимальный скор
-                max_score = max(topic_name_score, topic_desc_score)
-                
-                if max_score > best_semantic_score:
-                    best_semantic_score = max_score
-                    best_semantic_match = topic
+            # Вычисляем косинусное сходство
+            similarities = cosine_similarity(query_vector, topic_vectors)
             
-            if best_semantic_match and best_semantic_score >= 0.5:
-                logger.info(f"✅ Найдено семантическое совпадение: {best_semantic_match} (score: {best_semantic_score:.2f})")
-                return best_semantic_match, best_semantic_score, "семантическое сходство"
+            # Находим максимальное сходство
+            max_similarity_idx = similarities.argmax()
+            max_similarity = similarities[0, max_similarity_idx]
+            
+            if max_similarity > 0.1:  # Порог ниже, так как TF-IDF менее точен
+                best_match = list(DETAILED_TOPICS.keys())[max_similarity_idx]
+                logger.info(f"✅ Найдено TF-IDF совпадение: {best_match} (score: {max_similarity:.2f})")
+                return best_match, float(max_similarity), "TF-IDF сходство"
         
         # Шаг 4: Fallback - предлагаем самый популярный чат или чат, наиболее близкий по тематике
         logger.info("🔄 Fallback поиск...")
