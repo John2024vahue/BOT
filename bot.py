@@ -4,7 +4,6 @@ import sqlite3
 from datetime import datetime
 import re
 import json
-from collections import Counter
 import emoji
 import numpy as np
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -68,9 +67,6 @@ except LookupError:
     nltk.download('stopwords', quiet=True, download_dir=NLTK_DATA_DIR)
     print("✅ Основные данные NLTK скачаны")
 
-# УДАЛИТЕ эту строку (не нужен averaged_perceptron_tagger):
-# nltk.download('averaged_perceptron_tagger', quiet=True, download_dir=NLTK_DATA_DIR)
-
 # Настройка логирования для Railway
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -83,12 +79,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Логируем информацию о среде
+logger.info("=" * 50)
 logger.info(f"🚀 Запуск бота на Railway: {os.getenv('RAILWAY_ENVIRONMENT', 'Неизвестно')}")
 logger.info(f"📁 База данных: {DB_PATH}")
 logger.info(f"📁 NLTK данные: {NLTK_DATA_DIR}")
+logger.info(f"✅ Токен присутствует: {'Да' if BOT_TOKEN else 'Нет'}")
+logger.info(f"📏 Длина токена: {len(BOT_TOKEN) if BOT_TOKEN else 0}")
+logger.info("=" * 50)
 
 # Инициализация глобальных переменных для NLP
-model = None
 stop_words_ru = set(stopwords.words("russian"))
 stop_words_en = set(stopwords.words("english"))
 stemmer_ru = SnowballStemmer("russian")
@@ -122,7 +121,7 @@ DETAILED_TOPICS = {
         "emoji": "💪"
     },
     "Искусство и музыка": {
-        "keywords": ["искусство", "музыка", "творчество", "живопись", "рисование", "композиторы", "исполнители", "творческие", "художники", "графика", "скульптура", "архитектура", "классическая", "рок", "джаз", "поп", "эстрада", "инструменты", "гитара", "фортепиано"],
+        "keywords": ["искусство", "музыка", "творчество", "живопись", "рисование", "композиторы", "исполнители", "творческие", "художники", "графика", "скульpture", "архитектура", "классическая", "рок", "джаз", "поп", "эстрада", "инструменты", "гитара", "фортепиано"],
         "description": "Обсуждение искусства, музыки, творческих проектов и культурных событий.",
         "emoji": "🎨"
     },
@@ -345,9 +344,10 @@ def find_best_matching_chat(user_query):
         
         if best_match and best_score >= 0.3:
             logger.info(f"✅ Найдено совпадение по ключевым словам: {best_match} (score: {best_score:.2f})")
-            return best_match, best_score, match_reason
+            # Упрощаем причину для пользователя
+            return best_match, best_score, "совпадение по теме"
         
-                # Шаг 3: TF-IDF поиск (замена семантическому)
+        # Шаг 3: TF-IDF поиск (замена семантическому)
         logger.info("🔤 TF-IDF поиск...")
         if vectorizer is not None and topic_vectors is not None:
             # Преобразуем запрос в TF-IDF вектор
@@ -363,7 +363,7 @@ def find_best_matching_chat(user_query):
             if max_similarity > 0.1:  # Порог ниже, так как TF-IDF менее точен
                 best_match = list(DETAILED_TOPICS.keys())[max_similarity_idx]
                 logger.info(f"✅ Найдено TF-IDF совпадение: {best_match} (score: {max_similarity:.2f})")
-                return best_match, float(max_similarity), "TF-IDF сходство"
+                return best_match, float(max_similarity), "похожая тематика"
         
         # Шаг 4: Fallback - предлагаем самый популярный чат или чат, наиболее близкий по тематике
         logger.info("🔄 Fallback поиск...")
@@ -521,6 +521,9 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif user_input == "📋 Мои группы":
         return await groups_command(update, context)
     
+    elif user_input == "👤 Профиль":
+        return await profile_command(update, context)
+    
     elif user_input == "🎯 Популярные темы":
         return await show_popular_topics(update, context)
     
@@ -531,6 +534,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await support_command(update, context)
     
     else:
+        # Проверяем, не является ли это командой
+        if user_input.startswith('/'):
+            await update.message.reply_text(
+                "❓ **Неизвестная команда.** Используйте меню для выбора действия.",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
         # Умный поиск по любому сообщению
         await update.message.reply_text(
             "🔍 **Анализирую вашу тему...**\n\nПожалуйста, подождите немного, я ищу подходящие группы для вас.",
@@ -539,12 +551,24 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         chat_name, score, reason = find_best_matching_chat(user_input)
         
-        if chat_name:
+        if chat_name and score > 0.1:  # Фильтруем слишком низкие совпадения
+            # Убираем технические детали для пользователя
+            if reason == "точное совпадение":
+                reason_text = "идеально подходит под ваш запрос"
+            elif reason == "совпадение по теме":
+                reason_text = "совпадает с вашими интересами"
+            elif reason == "похожая тематика":
+                reason_text = "похожа на ваш запрос"
+            elif "ключевой термин" in reason:
+                reason_text = "содержит ключевые слова из вашего запроса"
+            else:
+                reason_text = "может быть интересна вам"
+            
             await update.message.reply_text(
-                f"🎯 **Идеально! Я нашел подходящую группу для вас!**\n\n"
+                f"🎯 **Я нашел подходящую группу для вас!**\n\n"
                 f"**Тема:** {chat_name}\n"
-                f"**Релевантность:** {score:.1%}\n"
-                f"**Почему эта группа:** {reason}\n\n"
+                f"**Почему эта группа:** {reason_text}\n\n"
+                f"**Описание:** {DETAILED_TOPICS[chat_name]['description']}\n\n"
                 f"Хотите присоединиться к группе «{chat_name}»?",
                 parse_mode='Markdown',
                 reply_markup=ReplyKeyboardMarkup([
@@ -574,13 +598,24 @@ async def handle_ask_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     chat_name, score, reason = find_best_matching_chat(user_topic)
     
-    if chat_name:
+    if chat_name and score > 0.1:  # Фильтруем слишком низкие совпадения
+        # Убираем технические детали для пользователя
+        if reason == "точное совпадение":
+            reason_text = "идеально подходит под ваш запрос"
+        elif reason == "совпадение по теме":
+            reason_text = "совпадает с вашими интересами"
+        elif reason == "похожая тематика":
+            reason_text = "похожа на ваш запрос"
+        elif "ключевой термин" in reason:
+            reason_text = "содержит ключевые слова из вашего запроса"
+        else:
+            reason_text = "может быть интересна вам"
+        
         await update.message.reply_text(
             f"🎯 **Отлично! Я нашел идеальную группу для вас!**\n\n"
             f"**Тема:** {chat_name}\n"
-            f"**Релевантность:** {score:.1%}\n"
-            f"**Почему эта группа:** {reason}\n\n"
-            f"👥 **Что обсуждают в группе:**\n{DETAILED_TOPICS[chat_name]['description']}\n\n"
+            f"**Почему эта группа:** {reason_text}\n\n"
+            f"**Описание:** {DETAILED_TOPICS[chat_name]['description']}\n\n"
             f"Хотите присоединиться к группе «{chat_name}»?",
             parse_mode='Markdown',
             reply_markup=ReplyKeyboardMarkup([
@@ -808,7 +843,7 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 3. Выберите подходящий чат из предложенных
 """
         await update.message.reply_text(no_groups_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
-        return
+        return MAIN_MENU
     
     groups_text = """
 📋 **Ваши группы**
@@ -822,6 +857,56 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     groups_text += f"\n💬 **Всего групп:** {len(user_chats)}"
     
     await update.message.reply_text(groups_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+    return MAIN_MENU
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показ профиля пользователя"""
+    user = update.message.from_user
+    user_id = user.id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Получаем данные пользователя
+    cursor.execute('''
+    SELECT username, first_name, language, last_active, 
+           (SELECT COUNT(*) FROM user_chats WHERE user_id = ?) as group_count
+    FROM users 
+    WHERE user_id = ?
+    ''', (user_id, user_id))
+    
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    if user_data:
+        username, first_name, language, last_active, group_count = user_data
+        last_active_formatted = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y %H:%M')
+        
+        profile_text = f"""
+👤 **Ваш профиль**
+
+📝 **Информация:**
+• ID: `{user_id}`
+• Имя: {first_name}
+• Username: @{username if username else 'не указан'}
+• Язык: {language}
+• Активность: {last_active_formatted}
+
+👥 **Статистика:**
+• Групп: {group_count}
+
+⚙️ **Настройки:**
+В разработке...
+"""
+    else:
+        profile_text = """
+👤 **Профиль не найден**
+
+Пожалуйста, начните с команды /start
+"""
+    
+    await update.message.reply_text(profile_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+    return MAIN_MENU
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показ справки"""
@@ -850,6 +935,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 Напишите /support для обращения к администратору
 """
     await update.message.reply_text(help_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+    return MAIN_MENU
 
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка команды поддержки"""
@@ -866,6 +952,71 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         [KeyboardButton("🏠 В меню"), KeyboardButton("❌ Отмена")]
     ], resize_keyboard=True))
     return SUPPORT
+
+async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка сообщения для поддержки"""
+    user_message = update.message.text.strip()
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username
+    first_name = update.message.from_user.first_name
+    
+    if user_message == "🏠 В меню":
+        await update.message.reply_text(
+            "🏠 **Вы вернулись в главное меню**\n\nВыберите действие:",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    elif user_message == "❌ Отмена":
+        await update.message.reply_text(
+            "❌ **Отправка в поддержку отменена.**\n\nВыберите действие:",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    else:
+        # Пересылаем сообщение админу
+        try:
+            admin_message = f"""
+🆘 **НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ**
+
+👤 **Пользователь:**
+ID: `{user_id}`
+Имя: {first_name}
+Username: @{username if username else 'не указан'}
+
+📝 **Сообщение:**
+{user_message}
+
+⏰ **Время:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+            
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=admin_message,
+                parse_mode='Markdown'
+            )
+            
+            await update.message.reply_text(
+                "✅ **Ваше сообщение отправлено администратору!**\n\n"
+                "Мы ответим вам в ближайшее время.\n\n"
+                "Спасибо за обращение!",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения админу: {e}")
+            await update.message.reply_text(
+                "❌ **Не удалось отправить сообщение.**\n\n"
+                "Попробуйте позже или свяжитесь с админом напрямую.",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка ошибок"""
@@ -920,11 +1071,14 @@ def main():
                 ASK_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ask_topic)],
                 CHOOSE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_popular_topic)],
                 JOIN_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_join_decision)],
-                SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_command)],
+                SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message)],
             },
             fallbacks=[
                 CommandHandler('start', start_command),
                 CommandHandler('help', help_command),
+                CommandHandler('profile', profile_command),
+                CommandHandler('support', support_command),
+                CommandHandler('groups', groups_command),
                 MessageHandler(filters.TEXT, handle_main_menu)
             ],
             allow_reentry=True
@@ -934,6 +1088,7 @@ def main():
         application.add_handler(CommandHandler('help', help_command))
         application.add_handler(CommandHandler('groups', groups_command))
         application.add_handler(CommandHandler('support', support_command))
+        application.add_handler(CommandHandler('profile', profile_command))
         
         logger.info("✅ Бот успешно инициализирован")
         logger.info("⚡ Бот запущен и готов к приему сообщений!")
