@@ -18,34 +18,931 @@ from nltk.stem import SnowballStemmer
 from textblob import TextBlob
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
-import threading
-from flask import Flask
+import sys
+import atexit
 
 # Загружаем переменные окружения
 load_dotenv()
 
-# ... (остальной код из вашего запроса остается без изменений до функции main)
+# Импортируем конфигурацию из config.py
+try:
+    from config import BOT_TOKEN, ADMIN_ID, NLTK_DATA_DIR
+except ImportError:
+    # Fallback на переменные окружения
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+    ADMIN_ID = int(os.getenv('ADMIN_ID', '6830411048'))
+    NLTK_DATA_DIR = os.getenv('NLTK_DATA_DIR', './nltk_data')
 
-def keep_alive():
-    """Функция для постоянной работы в Railway.app"""
-    app = Flask(__name__)
+# === ВАЖНО: Настройка путей для Railway ===
+def setup_railway_paths():
+    """Настройка путей для работы на Railway"""
     
-    @app.route('/')
-    def home():
-        return "✅ Бот активен и работает!"
+    # Создаем директории если их нет
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    os.makedirs('data', exist_ok=True)
     
-    def run():
-        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    # Настраиваем NLTK
+    nltk.data.path.append(NLTK_DATA_DIR)
     
-    threading.Thread(target=run, daemon=True).start()
-    logger.info(f"✅ HTTP сервер для keep-alive запущен на порту {os.environ.get('PORT', 8080)}")
+    # Путь к базе данных
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        # На Railway используем путь в /tmp для сохранения данных между рестартами
+        db_path = '/tmp/bot_database.db'
+        log_path = '/tmp/bot.log'
+    else:
+        # Локально используем текущую директорию
+        db_path = 'bot_database.db'
+        log_path = 'bot.log'
+    
+    return db_path, log_path
+
+# Получаем пути
+DB_PATH, LOG_PATH = setup_railway_paths()
+
+# Скачиваем необходимые данные NLTK
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    print("📥 Скачивание данных NLTK...")
+    nltk.download('punkt', quiet=True, download_dir=NLTK_DATA_DIR)
+    nltk.download('stopwords', quiet=True, download_dir=NLTK_DATA_DIR)
+    nltk.download('averaged_perceptron_tagger', quiet=True, download_dir=NLTK_DATA_DIR)
+    print("✅ Данные NLTK скачаны")
+
+# Настройка логирования для Railway
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Важно для просмотра логов в Railway
+        logging.FileHandler(LOG_PATH)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Логируем информацию о среде
+logger.info(f"🚀 Запуск бота на Railway: {os.getenv('RAILWAY_ENVIRONMENT', 'Неизвестно')}")
+logger.info(f"📁 База данных: {DB_PATH}")
+logger.info(f"📁 NLTK данные: {NLTK_DATA_DIR}")
+
+# Инициализация глобальных переменных для NLP
+model = None
+stop_words_ru = set(stopwords.words("russian"))
+stop_words_en = set(stopwords.words("english"))
+stemmer_ru = SnowballStemmer("russian")
+stemmer_en = SnowballStemmer("english")
+
+# Темы с подробными описаниями и ключевыми словами
+DETAILED_TOPICS = {
+    "Образование и Саморазвитие": {
+        "keywords": ["учеба", "саморазвитие", "книги", "курсы", "образование", "знание", "развитие", "психология", "мышление", "обучение", "университет", "школа", "знания", "самосовершенствование", "мотивация", "цели", "успех"],
+        "description": "Группа для тех, кто стремится к постоянному развитию, изучению нового и личностному росту.",
+        "emoji": "📚"
+    },
+    "Наука и литература": {
+        "keywords": ["наука", "литература", "книги", "авторы", "научные", "исследования", "научная", "фантастика", "классика", "поэзия", "проза", "литературные", "критика", "научпоп", "физика", "химия", "биология", "история"],
+        "description": "Обсуждение научных открытий, литературных произведений и авторов, научной фантастики и классики.",
+        "emoji": "🔬"
+    },
+    "Программирование": {
+        "keywords": ["программирование", "код", "разработка", "python", "javascript", "веб", "мобильные", "приложения", "алгоритмы", "бэкенд", "фронтенд", "дата", "аналитика", "машинное", "обучение", "искусственный", "интеллект", "нейронные", "сети"],
+        "description": "Группа для разработчиков, где обсуждаются языки программирования, фреймворки и технологии.",
+        "emoji": "💻"
+    },
+    "Экономика и Бизнес": {
+        "keywords": ["экономика", "бизнес", "финансы", "инвестиции", "стартап", "предпринимательство", "рынок", "деньги", "заработок", "доход", "прибыль", "капитал", "бизнесмен", "предприниматель", "трейдинг", "акции", "валюта", "криптовалюта", "форекс", "недвижимость"],
+        "description": "Обсуждение экономических новостей, бизнес-идей, инвестиций и финансовых стратегий.",
+        "emoji": "💰"
+    },
+    "Здоровье и медицина": {
+        "keywords": ["здоровье", "медицина", "фитнес", "питание", "спорт", "йога", "лечение", "профилактика", "психическое", "здоровье", "диета", "витамины", "лекарства", "болезни", "врачи", "психология", "стресс", "сон", "релаксация", "оздоровление"],
+        "description": "Группа о здоровье, фитнесе, правильном питании и медицинских аспектах.",
+        "emoji": "💪"
+    },
+    "Искусство и музыка": {
+        "keywords": ["искусство", "музыка", "творчество", "живопись", "рисование", "композиторы", "исполнители", "творческие", "художники", "графика", "скульптура", "архитектура", "классическая", "рок", "джаз", "поп", "эстрада", "инструменты", "гитара", "фортепиано"],
+        "description": "Обсуждение искусства, музыки, творческих проектов и культурных событий.",
+        "emoji": "🎨"
+    },
+    "Кулинария и рецепты": {
+        "keywords": ["кулинария", "рецепты", "готовка", "еда", "блюда", "ингредиенты", "вкусно", "домашняя", "кухни", "выпечка", "кондитерское", "десерты", "салаты", "супы", "вторые", "блюда", "напитки", "кофе", "чай", "вино"],
+        "description": "Группа для любителей готовить и обмениваться рецептами разных кухонь мира.",
+        "emoji": "🍳"
+    },
+    "Путешествие и туризм": {
+        "keywords": ["путешествие", "туризм", "страны", "город", "отдых", "отпуск", "достопримечательности", "экскурсии", "походы", "автомобильные", "туристические", "маршруты", "гостиницы", "отели", "авиабилеты", "визы", "пляж", "море", "горы", "природа", "экзотика", "бюджетные", "дорогие", "туристы"],
+        "description": "Обсуждение путешествий, туристических маршрутов, стран и мест для отдыха.",
+        "emoji": "✈️"
+    },
+    "Спорт": {
+        "keywords": ["спорт", "фитнес", "тренеровка", "чемпионат", "матчи", "здоровье", "физическая", "активность", "командный", "футбол", "баскетбол", "волейбол", "теннис", "плавание", "бег", "велосипед", "единоборства", "бокс", "бои", "тренажерный", "зал", "диета", "питание"],
+        "description": "Группа о спорте, физической активности и здоровом образе жизни.",
+        "emoji": "⚽"
+    },
+    "Иное": {
+        "keywords": ["разное", "другое", "всякое", "разное", "общее", "разные", "темы", "обсуждения", "общение", "флуд", "разговоры", "мемы", "юмор", "анекдоты", "интересное", "важное", "актуальное", "новости"],
+        "description": "Группа для общения на разные темы, которые не вошли в другие категории.",
+        "emoji": "🔄"
+    }
+}
+
+# ID реальных Telegram групп
+GROUP_IDS = {
+    "Образование и Саморазвитие": "-1003433439121",
+    "Наука и литература": "-1002820402117", 
+    "Программирование": "-1003477061325",
+    "Экономика и Бизнес": "-1003382139382",
+    "Здоровье и медицина": "-1003305866632",
+    "Искусство и музыка": "-1003378596165",
+    "Кулинария и рецепты": "-1003210673239",
+    "Путешествие и туризм": "-1003340734939",
+    "Спорт": "-1003300649893",
+    "Иное": "-1003307595772"
+}
+
+# Состояния для разговоров
+MAIN_MENU, ASK_TOPIC, CHOOSE_TOPIC, JOIN_CHAT, SUPPORT = range(5)
+
+# Глобальные переменные для кэширования
+topic_embeddings = {}
+topic_keywords = {}
+topic_vectors = None
+vectorizer = None
+
+def get_db_connection():
+    """Подключение к базе данных"""
+    return sqlite3.connect(DB_PATH)
+
+def init_database():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Таблица пользователей
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        language TEXT DEFAULT 'ru'
+    )
+    ''')
+
+    # Таблица чатов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_name TEXT UNIQUE,
+        telegram_group_id TEXT,
+        member_count INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT TRUE,
+        keywords TEXT DEFAULT '[]'
+    )
+    ''')
+
+    # Таблица участия пользователей в чатах
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_chats (
+        user_id INTEGER,
+        chat_id INTEGER,
+        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id),
+        FOREIGN KEY (chat_id) REFERENCES chats (chat_id),
+        PRIMARY KEY (user_id, chat_id)
+    )
+    ''')
+
+    # Таблица пула интересов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS interest_pool (
+        user_id INTEGER,
+        topic_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'pending',
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )
+    ''')
+
+    # Добавляем предопределенные темы
+    for topic, group_id in GROUP_IDS.items():
+        cursor.execute('''
+        INSERT OR IGNORE INTO chats (chat_name, telegram_group_id, keywords) 
+        VALUES (?, ?, ?)
+        ''', (topic, group_id, json.dumps(DETAILED_TOPICS[topic]['keywords'])))
+        
+    conn.commit()
+    conn.close()
+    logger.info("✅ База данных инициализирована")
+
+def preload_nlp_models():
+    """Предзагрузка NLP моделей для ускорения работы"""
+    global model, topic_embeddings, topic_keywords, topic_vectors, vectorizer
+    
+    logger.info("🔄 Загрузка NLP моделей...")
+    
+    try:
+        # Загружаем модель для работы с эмбеддингами
+        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        logger.info("✅ Модель SentenceTransformer загружена")
+        
+        # Готовим данные для поиска
+        topic_keywords = {}
+        topic_descriptions = {}
+        
+        for topic, data in DETAILED_TOPICS.items():
+            # Объединяем ключевые слова и описание
+            keywords = " ".join(data['keywords'])
+            description = data['description']
+            full_text = f"{topic} {keywords} {description}"
+            
+            topic_keywords[topic] = data['keywords']
+            topic_descriptions[topic] = full_text
+        
+        # Создаем эмбеддинги для всех тем
+        logger.info("🔄 Генерация эмбеддингов тем...")
+        topic_names = list(topic_descriptions.keys())
+        topic_texts = list(topic_descriptions.values())
+        
+        # Генерируем эмбеддинги пакетами для экономии памяти
+        embeddings = []
+        batch_size = 5  # Уменьшаем размер батча для Railway
+        
+        for i in range(0, len(topic_texts), batch_size):
+            batch = topic_texts[i:i+batch_size]
+            try:
+                batch_embeddings = model.encode(batch, convert_to_tensor=True, show_progress_bar=False)
+                embeddings.extend(batch_embeddings.cpu().numpy())
+                logger.info(f"✅ Обработано {min(i+batch_size, len(topic_texts))} из {len(topic_texts)} тем")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка при обработке батча: {e}")
+                # Добавляем нулевые векторы в случае ошибки
+                for _ in range(len(batch)):
+                    embeddings.append(np.zeros(384))  # Размерность модели
+        
+        # Сохраняем эмбеддинги
+        for i, topic in enumerate(topic_names):
+            if i < len(embeddings):
+                topic_embeddings[topic] = embeddings[i]
+        
+        logger.info(f"✅ Эмбеддинги тем сгенерированы: {len(topic_embeddings)} тем")
+        
+        logger.info("✅ NLP модели успешно загружены")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки NLP моделей: {e}")
+        logger.info("⚠️ Работа в режиме базового поиска")
+        model = None
+
+def preprocess_text(text, language='ru'):
+    """Предобработка текста для анализа"""
+    # Определяем язык, если не указан
+    if language == 'auto':
+        try:
+            language = detect(text)
+        except:
+            language = 'ru'
+    
+    # Приводим к нижнему регистру
+    text = text.lower()
+    
+    # Удаляем специальные символы и числа
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\d+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Токенизация
+    tokens = word_tokenize(text)
+    
+    # Удаляем стоп-слова и выполняем стемминг
+    if language.startswith('ru'):
+        tokens = [stemmer_ru.stem(token) for token in tokens if token not in stop_words_ru and len(token) > 2]
+    else:
+        tokens = [stemmer_en.stem(token) for token in tokens if token not in stop_words_en and len(token) > 2]
+    
+    return " ".join(tokens), language
+
+def get_semantic_similarity(text1, text2):
+    """Вычисление семантического сходства между текстами"""
+    try:
+        if model is None:
+            return 0.0
+        
+        # Генерируем эмбеддинги
+        embeddings = model.encode([text1, text2], convert_to_tensor=True)
+        
+        # Вычисляем косинусное сходство
+        from sentence_transformers import util
+        cosine_scores = util.pytorch_cos_sim(embeddings[0], embeddings[1])
+        
+        return float(cosine_scores[0][0])
+    except Exception as e:
+        logger.error(f"❌ Ошибка вычисления семантического сходства: {e}")
+        return 0.0
+
+def find_best_matching_chat(user_query):
+    """Интеллектуальный поиск наиболее подходящего чата"""
+    try:
+        logger.info(f"🔍 Поиск чата для запроса: '{user_query}'")
+        
+        # Определяем язык запроса
+        detected_lang = detect(user_query) if len(user_query) > 3 else 'ru'
+        logger.info(f"🗣️ Обнаружен язык: {detected_lang}")
+        
+        # Предобработка запроса
+        processed_query, query_lang = preprocess_text(user_query, detected_lang)
+        logger.info(f"⚙️ Обработанный запрос: '{processed_query}'")
+        
+        # Шаг 1: Проверяем на точное совпадение с названиями чатов
+        logger.info("🎯 Поиск точных совпадений...")
+        for chat_name, group_id in GROUP_IDS.items():
+            if (user_query.lower() in chat_name.lower() or 
+                chat_name.lower() in user_query.lower()):
+                logger.info(f"✅ Найдено точное совпадение: {chat_name}")
+                return chat_name, 1.0, "точное совпадение"
+        
+        # Шаг 2: Поиск по ключевым словам
+        logger.info("🔑 Поиск по ключевым словам...")
+        best_match = None
+        best_score = 0.0
+        match_reason = ""
+        
+        query_words = set(processed_query.split())
+        
+        for topic, data in DETAILED_TOPICS.items():
+            topic_keywords_set = set(word.lower() for word in data['keywords'])
+            intersection = query_words.intersection(topic_keywords_set)
+            
+            if intersection:
+                score = len(intersection) / len(topic_keywords_set)
+                if score > best_score:
+                    best_score = score
+                    best_match = topic
+                    match_reason = "ключевые слова: " + ", ".join(intersection)
+                    logger.info(f"🔍 Найдено совпадение по ключевым словам для '{topic}': {intersection}")
+        
+        if best_match and best_score >= 0.3:
+            logger.info(f"✅ Найдено совпадение по ключевым словам: {best_match} (score: {best_score:.2f})")
+            return best_match, best_score, match_reason
+        
+        # Шаг 3: Семантический поиск
+        logger.info("🧠 Семантический поиск...")
+        if model is not None:
+            best_semantic_match = None
+            best_semantic_score = 0.0
+            
+            for topic, embedding in topic_embeddings.items():
+                # Сравниваем с названием темы
+                topic_name_score = get_semantic_similarity(user_query, topic)
+                
+                # Сравниваем с описанием темы
+                topic_desc = DETAILED_TOPICS[topic]['description']
+                topic_desc_score = get_semantic_similarity(user_query, topic_desc)
+                
+                # Берем максимальный скор
+                max_score = max(topic_name_score, topic_desc_score)
+                
+                if max_score > best_semantic_score:
+                    best_semantic_score = max_score
+                    best_semantic_match = topic
+            
+            if best_semantic_match and best_semantic_score >= 0.5:
+                logger.info(f"✅ Найдено семантическое совпадение: {best_semantic_match} (score: {best_semantic_score:.2f})")
+                return best_semantic_match, best_semantic_score, "семантическое сходство"
+        
+        # Шаг 4: Fallback - предлагаем самый популярный чат или чат, наиболее близкий по тематике
+        logger.info("🔄 Fallback поиск...")
+        
+        # Определяем основную тему запроса
+        main_themes = {
+            "путешествие": ["Путешествие и туризм", "Спорт"],
+            "экономика": ["Экономика и Бизнес", "Образование и Саморазвитие"],
+            "здоровье": ["Здоровье и медицина", "Спорт"],
+            "программирование": ["Программирование", "Наука и литература"],
+            "искусство": ["Искусство и музыка", "Образование и Саморазвитие"],
+            "кулинария": ["Кулинария и рецепты", "Здоровье и медицина"],
+            "спорт": ["Спорт", "Здоровье и медицина"],
+            "наука": ["Наука и литература", "Образование и Саморазвитие"],
+            "образование": ["Образование и Саморазвитие", "Наука и литература"]
+        }
+        
+        for keyword, themes in main_themes.items():
+            if keyword in user_query.lower():
+                logger.info(f"🔄 Найден ключевой термин '{keyword}', предлагаю тему: {themes[0]}")
+                return themes[0], 0.4, f"ключевой термин: {keyword}"
+        
+        # Если ничего не нашли, предлагаем самый популярный чат
+        logger.info("⭐ Предлагаем самый популярный чат")
+        return "Путешествие и туризм", 0.3, "самый популярный чат"
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при поиске чата: {e}")
+        logger.info("🔄 Используем fallback вариант")
+        return "Путешествие и туризм", 0.3, "ошибка поиска"
+
+def get_invite_link_simple(group_id, bot_token):
+    """Получение инвайт-ссылки через API запрос"""
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/createChatInviteLink"
+        params = {
+            'chat_id': group_id,
+            'member_limit': 1,
+            'name': f'Инвайт от бота {datetime.now().strftime("%Y%m%d")}'
+        }
+        
+        response = requests.post(url, data=params, timeout=15)
+        data = response.json()
+        
+        if data.get('ok'):
+            return data['result']['invite_link']
+        else:
+            error_msg = data.get('description', 'Неизвестная ошибка')
+            logger.error(f"❌ Ошибка Telegram API: {error_msg}")
+            return f"❌ Ошибка Telegram: {error_msg}"
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при получении ссылки: {e}")
+        return f"❌ Сетевая ошибка: {str(e)}"
+
+def get_main_menu_keyboard():
+    """Получение клавиатуры главного меню"""
+    keyboard = [
+        [KeyboardButton("🔍 Найти группу по интересам")],
+        [KeyboardButton("📋 Мои группы"), KeyboardButton("👤 Профиль")],
+        [KeyboardButton("🎯 Популярные темы"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("🆘 Поддержка")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_popular_topics_keyboard():
+    """Получение клавиатуры популярных тем с эмодзи"""
+    keyboard = []
+    
+    # Группируем темы по 2 в строке
+    for i in range(0, len(DETAILED_TOPICS), 2):
+        row = []
+        for j in range(i, min(i+2, len(DETAILED_TOPICS))):
+            topic = list(DETAILED_TOPICS.keys())[j]
+            emoji = DETAILED_TOPICS[topic]['emoji']
+            row.append(KeyboardButton(f"{emoji} {topic}"))
+        keyboard.append(row)
+    
+    keyboard.append([KeyboardButton("🔙 Назад"), KeyboardButton("❌ Отказаться")])
+    
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приветствие с умным меню"""
+    user = update.message.from_user
+    
+    # Определяем язык пользователя
+    try:
+        user_lang = update.message.from_user.language_code
+    except:
+        user_lang = 'ru'
+    
+    # Сохраняем пользователя в БД
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT OR REPLACE INTO users (user_id, username, first_name, language, last_active)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ''', (user.id, user.username, user.first_name, user_lang[:2]))
+    conn.commit()
+    conn.close()
+    
+    welcome_text = f"""
+🤖 **Привет, {user.first_name}!**
+    
+🌟 **Я - ваш личный гид по миру единомышленников!**
+
+Здесь люди с общими интересами:
+✅ Создают совместные проекты
+✅ Обсуждают идеи и находят решения  
+✅ Развиваются вместе и поддерживают друг друга
+✅ Делятся знаниями и опытом
+
+🎯 **Что вас интересует сегодня?** Выберите действие из меню ниже 👇
+"""
+    
+    await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+    return MAIN_MENU
+
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора в главном меню"""
+    user_input = update.message.text.strip()
+    user_id = update.message.from_user.id
+    
+    # Обработка естественных запросов
+    if user_input.lower() in ["привет", "здравствуй", "hello", "hi", "привет!", "здравствуй!"]:
+        return await start_command(update, context)
+    
+    if user_input.lower() in ["пока", "до свидания", "пока!", "до свидания!"]:
+        goodbye_text = """
+👋 **До свидания!** 
+
+💡 **Не забывайте:** Вы всегда можете вернуться, нажав /start в любое время.
+
+🌟 **Ждем вас снова!**
+"""
+        await update.message.reply_text(goodbye_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+        return MAIN_MENU
+    
+    # Обработка команд меню
+    if user_input == "🔍 Найти группу по интересам":
+        await update.message.reply_text(
+            "🎯 **Что вас интересует?**\n\n"
+            "Напишите тему, например:\n"
+            "• 'путешествия по Азии'\n"
+            "• 'программирование на Python'\n"
+            "• 'здоровое питание'\n"
+            "• 'фотография и дизайн'\n\n"
+            "💡 **Или просто напишите ключевое слово:** 'путешествия', 'спорт', 'книги'",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ASK_TOPIC
+    
+    elif user_input == "📋 Мои группы":
+        return await groups_command(update, context)
+    
+    elif user_input == "🎯 Популярные темы":
+        return await show_popular_topics(update, context)
+    
+    elif user_input == "❓ Помощь":
+        return await help_command(update, context)
+    
+    elif user_input == "🆘 Поддержка":
+        return await support_command(update, context)
+    
+    else:
+        # Умный поиск по любому сообщению
+        await update.message.reply_text(
+            "🔍 **Анализирую вашу тему...**\n\nПожалуйста, подождите немного, я ищу подходящие группы для вас.",
+            parse_mode='Markdown'
+        )
+        
+        chat_name, score, reason = find_best_matching_chat(user_input)
+        
+        if chat_name:
+            await update.message.reply_text(
+                f"🎯 **Идеально! Я нашел подходящую группу для вас!**\n\n"
+                f"**Тема:** {chat_name}\n"
+                f"**Релевантность:** {score:.1%}\n"
+                f"**Почему эта группа:** {reason}\n\n"
+                f"Хотите присоединиться к группе «{chat_name}»?",
+                parse_mode='Markdown',
+                reply_markup=ReplyKeyboardMarkup([
+                    [KeyboardButton("✅ Присоединиться"), KeyboardButton("❌ Отказаться")],
+                    [KeyboardButton("🔄 Другие варианты"), KeyboardButton("🏠 В меню")]
+                ], resize_keyboard=True)
+            )
+            context.user_data['selected_chat'] = chat_name
+            return JOIN_CHAT
+        else:
+            await update.message.reply_text(
+                "🔍 **К сожалению, я не нашел подходящей группы по вашему запросу.**\n\n"
+                "🎯 **Попробуйте выбрать из популярных тем:**",
+                parse_mode='Markdown',
+                reply_markup=get_popular_topics_keyboard()
+            )
+            return CHOOSE_TOPIC
+
+async def handle_ask_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ввода темы с интеллектуальным поиском"""
+    user_topic = update.message.text.strip()
+    
+    await update.message.reply_text(
+        "🧠 **Анализирую ваш запрос...**\n\nЭто может занять 10-15 секунд. Я ищу самые релевантные группы для вас.",
+        parse_mode='Markdown'
+    )
+    
+    chat_name, score, reason = find_best_matching_chat(user_topic)
+    
+    if chat_name:
+        await update.message.reply_text(
+            f"🎯 **Отлично! Я нашел идеальную группу для вас!**\n\n"
+            f"**Тема:** {chat_name}\n"
+            f"**Релевантность:** {score:.1%}\n"
+            f"**Почему эта группа:** {reason}\n\n"
+            f"👥 **Что обсуждают в группе:**\n{DETAILED_TOPICS[chat_name]['description']}\n\n"
+            f"Хотите присоединиться к группе «{chat_name}»?",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardMarkup([
+                [KeyboardButton("✅ Присоединиться"), KeyboardButton("❌ Отказаться")]
+            ], resize_keyboard=True)
+        )
+        context.user_data['selected_chat'] = chat_name
+        context.user_data['user_topic'] = user_topic
+        return JOIN_CHAT
+    else:
+        await update.message.reply_text(
+            "🔍 **К сожалению, я не нашел подходящей группы по вашему запросу.**\n\n"
+            "🎯 **Попробуйте выбрать из популярных тем:**",
+            parse_mode='Markdown',
+            reply_markup=get_popular_topics_keyboard()
+        )
+        return CHOOSE_TOPIC
+
+async def handle_join_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка решения о присоединении"""
+    user_decision = update.message.text.strip()
+    user_id = update.message.from_user.id
+    
+    if user_decision == "❌ Отказаться":
+        await update.message.reply_text(
+            "👋 **Хорошо, вы отказались от присоединения.**\n\n"
+            "💡 **Это абсолютно нормально!** Вы можете найти другую группу или вернуться позже.\n\n"
+            "🎯 **Что дальше?**",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    if user_decision == "🏠 В меню":
+        await update.message.reply_text(
+            "🏠 **Вы вернулись в главное меню**\n\nВыберите действие:",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    if user_decision == "✅ Присоединиться":
+        chat_name = context.user_data.get('selected_chat')
+        if not chat_name:
+            await update.message.reply_text(
+                "❌ **Ошибка: чат не выбран.** Начните поиск заново с главного меню.",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        group_id = GROUP_IDS.get(chat_name)
+        if not group_id:
+            await update.message.reply_text(
+                f"❌ **Ошибка: группа «{chat_name}» не найдена в базе.** Пожалуйста, сообщите об этой ошибке в поддержку.",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
+            return MAIN_MENU
+        
+        # Получаем инвайт-ссылку
+        invite_link = get_invite_link_simple(group_id, BOT_TOKEN)
+        
+        if invite_link.startswith("https://t.me/"):
+            # Добавляем пользователя в чат
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Получаем chat_id из базы
+            cursor.execute('SELECT chat_id FROM chats WHERE chat_name = ?', (chat_name,))
+            result = cursor.fetchone()
+            chat_db_id = result[0] if result else None
+            
+            if chat_db_id:
+                cursor.execute('''
+                INSERT OR IGNORE INTO user_chats (user_id, chat_id) 
+                VALUES (?, ?)
+                ''', (user_id, chat_db_id))
+                
+                # Увеличиваем счетчик участников
+                cursor.execute('''
+                UPDATE chats SET member_count = member_count + 1 
+                WHERE chat_id = ?
+                ''', (chat_db_id,))
+                
+                conn.commit()
+                success = True
+            else:
+                success = False
+            
+            conn.close()
+            
+            if success:
+                success_text = f"""
+🎉 **Отлично! Вы успешно присоединились к группе «{chat_name}»!**
+
+🔗 **Ваша персональная ссылка:** {invite_link}
+
+🌟 **Что дальше:**
+• Нажмите на ссылку, чтобы войти в чат
+• Представьтесь участникам
+• Начните обсуждение или задайте вопрос
+• Найдите единомышленников для проектов
+
+💡 **Совет:** Активное участие поможет вам быстрее найти друзей и партнеров!
+
+🔄 **Хотите найти еще одну группу по другим интересам?** Нажмите "🔍 Найти группу по интересам" в меню!
+"""
+                await update.message.reply_text(success_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+                return MAIN_MENU
+            else:
+                await update.message.reply_text(
+                    "❌ **Ошибка при добавлении в базу данных.** Попробуйте позже.",
+                    parse_mode='Markdown',
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return MAIN_MENU
+        else:
+            error_text = f"""
+⚠️ **Не удалось получить ссылку для группы «{chat_name}»**
+
+❌ **Причина:** {invite_link}
+
+🔧 **Что проверить:**
+1. ID группы: `{group_id}`
+2. Бот добавлен в группу как администратор
+3. У бота есть права: `invite users`
+
+🔄 **Выберите другую тему для поиска:**
+"""
+            await update.message.reply_text(error_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+            return MAIN_MENU
+    
+    if user_decision == "🔄 Другие варианты":
+        return await show_popular_topics(update, context)
+    
+    # Если неизвестная команда
+    await update.message.reply_text(
+        "❓ **Неизвестная команда.** Пожалуйста, используйте кнопки для выбора действия.",
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
+    )
+    return MAIN_MENU
+
+async def show_popular_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ популярных тем с эмодзи"""
+    response_text = "🎯 **Выберите интересующую вас тему из популярных:**"
+    
+    await update.message.reply_text(response_text, reply_markup=get_popular_topics_keyboard(), parse_mode='Markdown')
+    return CHOOSE_TOPIC
+
+async def handle_popular_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора популярной темы"""
+    user_input = update.message.text.strip()
+    
+    if user_input == "❌ Отказаться":
+        goodbye_text = """
+👋 **До свидания!** 
+
+💡 **Не забывайте:** Вы всегда можете вернуться, нажав /start в любое время.
+
+🌟 **Ждем вас снова!**
+"""
+        await update.message.reply_text(goodbye_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+        return MAIN_MENU
+    
+    if user_input == "🔙 Назад":
+        await update.message.reply_text(
+            "🏠 **Вы вернулись в главное меню**\n\nВыберите действие:",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return MAIN_MENU
+    
+    # Извлекаем название темы из кнопки с эмодзи
+    topic_name = user_input.split(' ', 1)[-1] if ' ' in user_input else user_input
+    
+    if topic_name in GROUP_IDS:
+        chat_name = topic_name
+        await update.message.reply_text(
+            f"🎯 **Отличный выбор!**\n\n"
+            f"**Тема:** {chat_name}\n"
+            f"**Описание:** {DETAILED_TOPICS[chat_name]['description']}\n\n"
+            f"👥 **Участники уже обсуждают:**\n"
+            f"• {', '.join(DETAILED_TOPICS[chat_name]['keywords'][:3])}\n\n"
+            f"Хотите присоединиться к группе «{chat_name}»?",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardMarkup([
+                [KeyboardButton("✅ Присоединиться"), KeyboardButton("❌ Отказаться")],
+                [KeyboardButton("🔄 Другие темы"), KeyboardButton("🏠 В меню")]
+            ], resize_keyboard=True)
+        )
+        context.user_data['selected_chat'] = chat_name
+        return JOIN_CHAT
+    else:
+        await update.message.reply_text(
+            f"⚠️ **Группа «{topic_name}» временно недоступна.** Выберите другую тему:",
+            parse_mode='Markdown',
+            reply_markup=get_popular_topics_keyboard()
+        )
+        return CHOOSE_TOPIC
+
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показ групп пользователя"""
+    user_id = update.message.from_user.id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT c.chat_name 
+    FROM chats c
+    JOIN user_chats uc ON c.chat_id = uc.chat_id
+    WHERE uc.user_id = ? AND c.is_active = 1
+    ''', (user_id,))
+    user_chats = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    if not user_chats:
+        no_groups_text = """
+❌ **Вы пока не состоите ни в одной группе**
+
+🎯 **Как найти свою первую группу:**
+1. Нажмите "🔍 Найти группу по интересам" в главном меню
+2. Напишите, чем вы увлекаетесь
+3. Выберите подходящий чат из предложенных
+"""
+        await update.message.reply_text(no_groups_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+        return
+    
+    groups_text = """
+📋 **Ваши группы**
+
+🌟 **Вы состоите в следующих чатах:**
+"""
+    
+    for i, chat_name in enumerate(user_chats, 1):
+        groups_text += f"{i}. {chat_name}\n"
+    
+    groups_text += f"\n💬 **Всего групп:** {len(user_chats)}"
+    
+    await update.message.reply_text(groups_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показ справки"""
+    help_text = """
+📖 **Справка по боту**
+
+🎯 **Как это работает:**
+1. Вы указываете тему, которая вас интересует
+2. Бот **умно ищет** подходящие чаты по ключевым словам
+3. Если находит - предлагает присоединиться
+4. Если нет - уточняет тему или предлагает похожие варианты
+5. Популярные темы всегда доступны в меню
+
+🧠 **Умный поиск:**
+• Бот понимает **синонимы** (деньги → экономика)
+• Анализирует **контекст** (заработок → бизнес)
+• Ищет **похожие темы** при неточных совпадениях
+• Предлагает **релевантные варианты** даже если точного совпадения нет
+
+💡 **Важно:**
+• Бот добавляет вас только в тематические чаты
+• Ссылки для приглашения одноразовые
+• Вы всегда можете отказаться от присоединения
+
+🆘 **Поддержка:**
+Напишите /support для обращения к администратору
+"""
+    await update.message.reply_text(help_text, parse_mode='Markdown', reply_markup=get_main_menu_keyboard())
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка команды поддержки"""
+    support_text = """
+🆘 **Поддержка**
+
+Напишите ваш вопрос или проблему, и я передам сообщение администратору.
+
+⚠️ **Важно:** Это не техническая поддержка Telegram, а поддержка именно этого бота.
+
+✏️ **Введите ваше сообщение ниже:**
+"""
+    await update.message.reply_text(support_text, parse_mode='Markdown', reply_markup=ReplyKeyboardMarkup([
+        [KeyboardButton("🏠 В меню"), KeyboardButton("❌ Отмена")]
+    ], resize_keyboard=True))
+    return SUPPORT
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка ошибок"""
+    logger.error(f"Ошибка при обработке обновления {update}: {context.error}")
+    
+    try:
+        if update and update.message:
+            await update.message.reply_text(
+                "❌ **Произошла ошибка при обработке вашего запроса.**\n\n"
+                "Попробуйте еще раз или используйте команду /start",
+                parse_mode='Markdown'
+            )
+    except:
+        pass
+
+def cleanup():
+    """Очистка при завершении работы"""
+    logger.info("🧹 Очистка ресурсов...")
+    # Закрываем соединения с базой данных и т.д.
 
 def main():
     """Основная функция запуска бота"""
-    # Запускаем keep-alive сервер для Railway
-    keep_alive()
-    
     logger.info("🚀 Запуск Telegram бота с интеллектуальным поиском...")
+    
+    # Регистрируем очистку при завершении
+    atexit.register(cleanup)
+    
+    # Проверяем наличие токена
+    if not BOT_TOKEN:
+        logger.critical("❌ BOT_TOKEN не найден!")
+        logger.critical("Добавьте BOT_TOKEN в переменные окружения Railway")
+        sys.exit(1)
     
     # Инициализация базы данных
     init_database()
@@ -53,18 +950,29 @@ def main():
     # Загрузка NLP моделей
     preload_nlp_models()
     
-    BOT_TOKEN = os.getenv('BOT_TOKEN')
-    if not BOT_TOKEN:
-        logger.critical("❌ BOT_TOKEN не найден в переменных окружения!")
-        logger.critical("Пожалуйста, установите BOT_TOKEN в Railway Variables")
-        return
-    
     try:
+        # Создаем приложение
         application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Добавляем обработчик ошибок
+        application.add_error_handler(error_handler)
         
         # Добавляем обработчики
         conv_handler = ConversationHandler(
-            # ... (остальной код без изменений)
+            entry_points=[CommandHandler('start', start_command)],
+            states={
+                MAIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu)],
+                ASK_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ask_topic)],
+                CHOOSE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_popular_topic)],
+                JOIN_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_join_decision)],
+                SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_command)],
+            },
+            fallbacks=[
+                CommandHandler('start', start_command),
+                CommandHandler('help', help_command),
+                MessageHandler(filters.TEXT, handle_main_menu)
+            ],
+            allow_reentry=True
         )
         
         application.add_handler(conv_handler)
@@ -76,11 +984,15 @@ def main():
         logger.info("⚡ Бот запущен и готов к приему сообщений!")
         
         # Запускаем в режиме polling
-        application.run_polling(drop_pending_updates=True)
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
         logger.critical(f"🔥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
-        logger.critical("Проверьте правильность настроек в Railway")
+        logger.critical("Проверьте правильность BOT_TOKEN в переменных окружения Railway")
+        raise
 
 if __name__ == "__main__":
     main()
