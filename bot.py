@@ -62,7 +62,7 @@ DB_PATH, LOG_PATH = setup_railway_paths()
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    print("📥 Скачивание ОСНОВНЫХ данных NLTК...")
+    print("📥 Скачивание ОСНОВНЫХ данных NLTK...")
     nltk.download('punkt', quiet=True, download_dir=NLTK_DATA_DIR)
     nltk.download('stopwords', quiet=True, download_dir=NLTK_DATA_DIR)
     print("✅ Основные данные NLTK скачаны")
@@ -85,7 +85,6 @@ logger.info(f"📁 База данных: {DB_PATH}")
 logger.info(f"📁 NLTK данные: {NLTK_DATA_DIR}")
 logger.info(f"✅ Токен присутствует: {'Да' if BOT_TOKEN else 'Нет'}")
 logger.info(f"📏 Длина токена: {len(BOT_TOKEN) if BOT_TOKEN else 0}")
-logger.info(f"👑 Админ ID: {ADMIN_ID}")
 logger.info("=" * 50)
 
 # Инициализация глобальных переменных для NLP
@@ -185,8 +184,7 @@ def init_database():
         username TEXT,
         first_name TEXT,
         last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        language TEXT DEFAULT 'ru',
-        registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        language TEXT DEFAULT 'ru'
     )
     ''')
 
@@ -214,28 +212,13 @@ def init_database():
     )
     ''')
 
-    # Таблица пула интересов (сохраняем интересы пользователей для будущих чатов)
+    # Таблица пула интересов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS interest_pool (
-        interest_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         topic_name TEXT,
-        query_text TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         status TEXT DEFAULT 'pending',
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )
-    ''')
-
-    # Таблица сообщений поддержки
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS support_messages (
-        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        user_message TEXT,
-        admin_response TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'new',
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
@@ -325,11 +308,14 @@ def find_best_matching_chat(user_query):
         
         # Определяем язык запроса
         detected_lang = detect(user_query) if len(user_query) > 3 else 'ru'
+        logger.info(f"🗣️ Обнаружен язык: {detected_lang}")
         
         # Предобработка запроса
         processed_query, query_lang = preprocess_text(user_query, detected_lang)
+        logger.info(f"⚙️ Обработанный запрос: '{processed_query}'")
         
         # Шаг 1: Проверяем на точное совпадение с названиями чатов
+        logger.info("🎯 Поиск точных совпадений...")
         for chat_name, group_id in GROUP_IDS.items():
             if (user_query.lower() in chat_name.lower() or 
                 chat_name.lower() in user_query.lower()):
@@ -337,8 +323,10 @@ def find_best_matching_chat(user_query):
                 return chat_name, 1.0, "точное совпадение"
         
         # Шаг 2: Поиск по ключевым словам
+        logger.info("🔑 Поиск по ключевым словам...")
         best_match = None
         best_score = 0.0
+        match_reason = ""
         
         query_words = set(processed_query.split())
         
@@ -351,12 +339,16 @@ def find_best_matching_chat(user_query):
                 if score > best_score:
                     best_score = score
                     best_match = topic
+                    match_reason = "ключевые слова: " + ", ".join(intersection)
+                    logger.info(f"🔍 Найдено совпадение по ключевым словам для '{topic}': {intersection}")
         
         if best_match and best_score >= 0.3:
             logger.info(f"✅ Найдено совпадение по ключевым словам: {best_match} (score: {best_score:.2f})")
-            return best_match, best_score, "совпадение по ключевым словам"
+            # Упрощаем причину для пользователя
+            return best_match, best_score, "совпадение по теме"
         
-        # Шаг 3: TF-IDF поиск
+        # Шаг 3: TF-IDF поиск (замена семантическому)
+        logger.info("🔤 TF-IDF поиск...")
         if vectorizer is not None and topic_vectors is not None:
             # Преобразуем запрос в TF-IDF вектор
             query_vector = vectorizer.transform([processed_query])
@@ -368,47 +360,40 @@ def find_best_matching_chat(user_query):
             max_similarity_idx = similarities.argmax()
             max_similarity = similarities[0, max_similarity_idx]
             
-            if max_similarity > 0.15:  # Повышен порог для лучшей точности
+            if max_similarity > 0.1:  # Порог ниже, так как TF-IDF менее точен
                 best_match = list(DETAILED_TOPICS.keys())[max_similarity_idx]
                 logger.info(f"✅ Найдено TF-IDF совпадение: {best_match} (score: {max_similarity:.2f})")
                 return best_match, float(max_similarity), "похожая тематика"
         
-        # Шаг 4: Поиск по ключевым терминам (пониженный порог)
+        # Шаг 4: Fallback - предлагаем самый популярный чат или чат, наиболее близкий по тематике
+        logger.info("🔄 Fallback поиск...")
+        
+        # Определяем основную тему запроса
         main_themes = {
-            "путешествие": "Путешествие и туризм",
-            "экономика": "Экономика и Бизнес",
-            "здоровье": "Здоровье и медицина",
-            "программирование": "Программирование",
-            "искусство": "Искусство и музыка",
-            "кулинария": "Кулинария и рецепты",
-            "спорт": "Спорт",
-            "наука": "Наука и литература",
-            "образование": "Образование и Саморазвитие",
-            "финансы": "Экономика и Бизнес",
-            "деньги": "Экономика и Бизнес",
-            "бизнес": "Экономика и Бизнес",
-            "книги": "Наука и литература",
-            "фитнес": "Спорт",
-            "музыка": "Искусство и музыка",
-            "живопись": "Искусство и музыка",
-            "готовка": "Кулинария и рецепты",
-            "туризм": "Путешествие и туризм",
-            "развитие": "Образование и Саморазвитие",
-            "психология": "Образование и Саморазвитие"
+            "путешествие": ["Путешествие и туризм", "Спорт"],
+            "экономика": ["Экономика и Бизнес", "Образование и Саморазвитие"],
+            "здоровье": ["Здоровье и медицина", "Спорт"],
+            "программирование": ["Программирование", "Наука и литература"],
+            "искусство": ["Искусство и музыка", "Образование и Саморазвитие"],
+            "кулинария": ["Кулинария и рецепты", "Здоровье и медицина"],
+            "спорт": ["Спорт", "Здоровье и медицина"],
+            "наука": ["Наука и литература", "Образование и Саморазвитие"],
+            "образование": ["Образование и Саморазвитие", "Наука и литература"]
         }
         
-        for keyword, topic in main_themes.items():
+        for keyword, themes in main_themes.items():
             if keyword in user_query.lower():
-                logger.info(f"✅ Найден ключевой термин '{keyword}', предлагаю тему: {topic}")
-                return topic, 0.4, f"ключевой термин: {keyword}"
+                logger.info(f"🔄 Найден ключевой термин '{keyword}', предлагаю тему: {themes[0]}")
+                return themes[0], 0.4, f"ключевой термин: {keyword}"
         
-        # Если ничего не нашли
-        logger.info("❌ Подходящий чат не найден")
-        return None, 0.0, "не найдено"
+        # Если ничего не нашли, предлагаем самый популярный чат
+        logger.info("⭐ Предлагаем самый популярный чат")
+        return "Путешествие и туризм", 0.3, "самый популярный чат"
         
     except Exception as e:
         logger.error(f"❌ Ошибка при поиске чата: {e}")
-        return None, 0.0, "ошибка поиска"
+        logger.info("🔄 Используем fallback вариант")
+        return "Путешествие и туризм", 0.3, "ошибка поиска"
 
 def get_invite_link_simple(group_id, bot_token):
     """Получение инвайт-ссылки через API запрос"""
@@ -475,9 +460,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT OR REPLACE INTO users (user_id, username, first_name, language, last_active, registration_date)
-    VALUES (?, ?, ?, ?, datetime('now'), COALESCE((SELECT registration_date FROM users WHERE user_id = ?), datetime('now')))
-    ''', (user.id, user.username, user.first_name, user_lang[:2], user.id))
+    INSERT OR REPLACE INTO users (user_id, username, first_name, language, last_active)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ''', (user.id, user.username, user.first_name, user_lang[:2]))
     conn.commit()
     conn.close()
     
@@ -558,14 +543,49 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return MAIN_MENU
         
-        # Если пользователь просто написал что-то в главном меню - предлагаем поиск
+        # Умный поиск по любому сообщению
         await update.message.reply_text(
-            "🔍 **Хотите найти группу по вашему запросу?**\n\n"
-            "Нажмите кнопку ниже для поиска групп по интересам!",
-            parse_mode='Markdown',
-            reply_markup=get_main_menu_keyboard()
+            "🔍 **Анализирую вашу тему...**\n\nПожалуйста, подождите немного, я ищу подходящие группы для вас.",
+            parse_mode='Markdown'
         )
-        return MAIN_MENU
+        
+        chat_name, score, reason = find_best_matching_chat(user_input)
+        
+        if chat_name and score > 0.1:  # Фильтруем слишком низкие совпадения
+            # Убираем технические детали для пользователя
+            if reason == "точное совпадение":
+                reason_text = "идеально подходит под ваш запрос"
+            elif reason == "совпадение по теме":
+                reason_text = "совпадает с вашими интересами"
+            elif reason == "похожая тематика":
+                reason_text = "похожа на ваш запрос"
+            elif "ключевой термин" in reason:
+                reason_text = "содержит ключевые слова из вашего запроса"
+            else:
+                reason_text = "может быть интересна вам"
+            
+            await update.message.reply_text(
+                f"🎯 **Я нашел подходящую группу для вас!**\n\n"
+                f"**Тема:** {chat_name}\n"
+                f"**Почему эта группа:** {reason_text}\n\n"
+                f"**Описание:** {DETAILED_TOPICS[chat_name]['description']}\n\n"
+                f"Хотите присоединиться к группе «{chat_name}»?",
+                parse_mode='Markdown',
+                reply_markup=ReplyKeyboardMarkup([
+                    [KeyboardButton("✅ Присоединиться"), KeyboardButton("❌ Отказаться")],
+                    [KeyboardButton("🔄 Другие варианты"), KeyboardButton("🏠 В меню")]
+                ], resize_keyboard=True)
+            )
+            context.user_data['selected_chat'] = chat_name
+            return JOIN_CHAT
+        else:
+            await update.message.reply_text(
+                "🔍 **К сожалению, я не нашел подходящей группы по вашему запросу.**\n\n"
+                "🎯 **Попробуйте выбрать из популярных тем:**",
+                parse_mode='Markdown',
+                reply_markup=get_popular_topics_keyboard()
+            )
+            return CHOOSE_TOPIC
 
 async def handle_ask_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка ввода темы с интеллектуальным поиском"""
@@ -578,23 +598,11 @@ async def handle_ask_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     chat_name, score, reason = find_best_matching_chat(user_topic)
     
-    # Сохраняем запрос пользователя в базу для учета интересов
-    if user_topic:
-        user_id = update.message.from_user.id
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-        INSERT INTO interest_pool (user_id, topic_name, query_text)
-        VALUES (?, ?, ?)
-        ''', (user_id, user_topic[:100], user_topic[:500]))
-        conn.commit()
-        conn.close()
-    
-    if chat_name:
+    if chat_name and score > 0.1:  # Фильтруем слишком низкие совпадения
         # Убираем технические детали для пользователя
         if reason == "точное совпадение":
             reason_text = "идеально подходит под ваш запрос"
-        elif reason == "совпадение по ключевым словам":
+        elif reason == "совпадение по теме":
             reason_text = "совпадает с вашими интересами"
         elif reason == "похожая тематика":
             reason_text = "похожа на ваш запрос"
@@ -618,27 +626,9 @@ async def handle_ask_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data['user_topic'] = user_topic
         return JOIN_CHAT
     else:
-        # Сохраняем интерес пользователя для будущих чатов
-        user_id = update.message.from_user.id
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-        INSERT INTO interest_pool (user_id, topic_name, query_text)
-        VALUES (?, ?, ?)
-        ''', (user_id, "новый интерес", user_topic[:500]))
-        conn.commit()
-        conn.close()
-        
-        no_match_text = f"""
-🔍 **К сожалению, я не нашел подходящей группы по запросу «{user_topic}».**
-
-💡 **Мы учтем ваш интерес!** 
-Мы сохранили ваш запрос и, возможно, скоро откроем такой чат.
-
-🎯 **А пока, можете выбрать из популярных тем:**
-"""
         await update.message.reply_text(
-            no_match_text,
+            "🔍 **К сожалению, я не нашел подходящей группы по вашему запросу.**\n\n"
+            "🎯 **Попробуйте выбрать из популярных тем:**",
             parse_mode='Markdown',
             reply_markup=get_popular_topics_keyboard()
         )
@@ -879,55 +869,34 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     # Получаем данные пользователя
     cursor.execute('''
-    SELECT username, first_name, language, last_active, registration_date,
-           (SELECT COUNT(*) FROM user_chats WHERE user_id = ?) as group_count,
-           (SELECT COUNT(*) FROM interest_pool WHERE user_id = ?) as interests_count
+    SELECT username, first_name, language, last_active, 
+           (SELECT COUNT(*) FROM user_chats WHERE user_id = ?) as group_count
     FROM users 
     WHERE user_id = ?
-    ''', (user_id, user_id, user_id))
+    ''', (user_id, user_id))
     
     user_data = cursor.fetchone()
     conn.close()
     
     if user_data:
-        username, first_name, language, last_active, registration_date, group_count, interests_count = user_data
-        
-        # Форматируем даты
-        try:
-            last_active_formatted = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y %H:%M')
-            registration_formatted = datetime.strptime(registration_date, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y')
-        except:
-            last_active_formatted = last_active
-            registration_formatted = registration_date
+        username, first_name, language, last_active, group_count = user_data
+        last_active_formatted = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y %H:%M')
         
         profile_text = f"""
 👤 **Ваш профиль**
 
-📝 **Основная информация:**
+📝 **Информация:**
 • ID: `{user_id}`
 • Имя: {first_name}
 • Username: @{username if username else 'не указан'}
 • Язык: {language}
-• Дата регистрации: {registration_formatted}
-• Последняя активность: {last_active_formatted}
+• Активность: {last_active_formatted}
 
-📊 **Статистика:**
-• Активных групп: {group_count}
-• Найдено интересов: {interests_count}
-• Начато поисков: {interests_count}
-
-🏆 **Достижения:**
-{'• Знакомство с ботом ✅' if group_count >= 0 else ''}
-{'• Первая группа ✅' if group_count >= 1 else '• Первая группа ⏳'}
-{'• Активный участник ✅' if group_count >= 3 else '• Активный участник ⏳'}
-{'• Лидер сообщества ✅' if group_count >= 5 else '• Лидер сообщества ⏳'}
+👥 **Статистика:**
+• Групп: {group_count}
 
 ⚙️ **Настройки:**
-• Уведомления: включены
-• Язык интерфейса: русский
-• Темная тема: по умолчанию
-
-💡 **Совет:** Чем больше групп вы попробуете, тем точнее бот сможет рекомендовать вам интересные темы!
+В разработке...
 """
     else:
         profile_text = """
@@ -1008,16 +977,6 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
         return MAIN_MENU
     
     else:
-        # Сохраняем сообщение в базу данных
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-        INSERT INTO support_messages (user_id, user_message, status)
-        VALUES (?, ?, ?)
-        ''', (user_id, user_message, 'new'))
-        conn.commit()
-        conn.close()
-        
         # Пересылаем сообщение админу
         try:
             admin_message = f"""
@@ -1051,11 +1010,9 @@ Username: @{username if username else 'не указан'}
             
         except Exception as e:
             logger.error(f"❌ Ошибка отправки сообщения админу: {e}")
-            # Сообщение уже сохранено в БД, админ сможет прочитать позже
             await update.message.reply_text(
-                "✅ **Ваше сообщение сохранено!**\n\n"
-                "Администратор получит его, как только будет онлайн, и ответит вам.\n\n"
-                "Спасибо за обращение!",
+                "❌ **Не удалось отправить сообщение.**\n\n"
+                "Попробуйте позже или свяжитесь с админом напрямую.",
                 parse_mode='Markdown',
                 reply_markup=get_main_menu_keyboard()
             )
