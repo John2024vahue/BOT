@@ -59,15 +59,17 @@ def setup_railway_paths():
 # Получаем пути
 DB_PATH, LOG_PATH = setup_railway_paths()
 
-# Скачиваем необходимые данные NLTK
+# Скачиваем только ОСНОВНЫЕ данные NLTK
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
-    print("📥 Скачивание данных NLTK...")
+    print("📥 Скачивание ОСНОВНЫХ данных NLTK...")
     nltk.download('punkt', quiet=True, download_dir=NLTK_DATA_DIR)
     nltk.download('stopwords', quiet=True, download_dir=NLTK_DATA_DIR)
-    nltk.download('averaged_perceptron_tagger', quiet=True, download_dir=NLTK_DATA_DIR)
-    print("✅ Данные NLTK скачаны")
+    print("✅ Основные данные NLTK скачаны")
+
+# УДАЛИТЕ эту строку (не нужен averaged_perceptron_tagger):
+# nltk.download('averaged_perceptron_tagger', quiet=True, download_dir=NLTK_DATA_DIR)
 
 # Настройка логирования для Railway
 logging.basicConfig(
