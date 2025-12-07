@@ -1,20 +1,14 @@
-# Игнорируем базу данных и логи
-bot_database.db
-bot.log
-*.log
-
-# Игнорируем локальные настройки
 .env
+*.log
+*.db
+*.sqlite3
 __pycache__/
 *.pyc
-
-# Игнорируем виртуальное окружение
-venv/
-.env/
-mybot/
-
-# Игнорируем IDE файлы
+*.pyo
+*.pyd
+.Python
+nltk_data/
+data/
+.DS_Store
 .idea/
 .vscode/
-*.swp
-*.swo
