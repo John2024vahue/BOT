@@ -1,14 +1,7 @@
 {
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "pip install --upgrade pip && pip install -r requirements.txt",
-    "nixpacksConfig": {
-      "phases": {
-        "setup": {
-          "aptPkgs": ["gcc", "g++", "python3-dev", "build-essential", "libpq-dev"]
-        }
-      }
-    }
+    "buildCommand": "pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt && rm -rf /root/.cache/pip"
   },
   "deploy": {
     "startCommand": "python bot.py",
